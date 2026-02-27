@@ -354,6 +354,18 @@ if [[ -f "${EAPHAMMER_DIR}/requirements.txt" ]]; then
     fi
 fi
 
+# ── Captive portal WebSocket dependencies (required) ───────────────────────
+# eaphammer's wskeyloggerd uses Flask-SocketIO with socketio.run().
+# Flask-SocketIO requires gevent or eventlet as the async backend — without
+# them Werkzeug 3.x raises RuntimeError and the captive portal fails entirely.
+# eaphammer's pip.req only lists gevent>=1.5.0 but NOT gevent-websocket, so
+# we enforce both here explicitly as required (not optional) packages.
+step "Captive portal WebSocket dependencies"
+
+for pkg in "gevent>=24.0.0" "gevent-websocket>=0.10.1"; do
+    pip_install "$pkg"
+done
+
 # Run eaphammer's own setup if present
 if [[ -f "${EAPHAMMER_DIR}/setup.py" ]]; then
     info "Running eaphammer setup.py install ..."
@@ -502,13 +514,16 @@ PYEOF
         warn "No local eaphammer binary found — patch skipped (will fall back to system eaphammer)"
     fi
 
-    # Update EAP_ACTIVE_CERT path if eaphammer uses a local cert dir
-    LOCAL_CERT_DIR="${EAPHAMMER_DIR}/certs"
-    if [[ -d "$LOCAL_CERT_DIR" ]]; then
-        sed -i "s|EAP_ACTIVE_CERT=\"/etc/eaphammer/certs/active/fullchain.pem\"|EAP_ACTIVE_CERT=\"${LOCAL_CERT_DIR}/active/fullchain.pem\"|" \
-            "$MAIN_SCRIPT" >> "$LOG_FILE" 2>&1 \
-            && ok "EAP_ACTIVE_CERT patched to $LOCAL_CERT_DIR/active/fullchain.pem" \
-            || warn "Could not patch EAP_ACTIVE_CERT (manual update may be needed)"
+    # Verify EAP_ACTIVE_CERT resolves via ${SCRIPT_DIR} (dynamic — set in source).
+    # Belt-and-suspenders: if the file somehow still carries a hardcoded absolute
+    # path (any value that doesn't reference ${SCRIPT_DIR}), replace it now.
+    if grep -q 'EAP_ACTIVE_CERT="[^$]' "$MAIN_SCRIPT" 2>/dev/null; then
+        sed -i 's|EAP_ACTIVE_CERT="[^"]*"|EAP_ACTIVE_CERT="${SCRIPT_DIR}/WiFiZer0_Tools/eaphammer/certs/active/fullchain.pem"|' \
+            "$MAIN_SCRIPT" \
+            && ok "EAP_ACTIVE_CERT corrected to use \${SCRIPT_DIR} (was hardcoded)" \
+            || warn "Could not patch EAP_ACTIVE_CERT — check $MAIN_SCRIPT line 38"
+    else
+        ok "EAP_ACTIVE_CERT already uses \${SCRIPT_DIR} — no patch needed"
     fi
 
     chmod +x "$MAIN_SCRIPT"
@@ -650,15 +665,17 @@ step "Python package verification"
 PKG_REPORT=$("$VENV_PYTHON" - << 'PYEOF' 2>/dev/null
 import importlib.util
 pkgs = {
-    'flask':          'Flask',
-    'flask_cors':     'Flask-CORS',
-    'flask_socketio': 'Flask-SocketIO',
-    'OpenSSL':        'pyOpenSSL',
-    'bs4':            'beautifulsoup4',
-    'tqdm':           'tqdm',
-    'pem':            'pem',
-    'cryptography':   'cryptography',
-    'scapy':          'scapy',
+    'flask':              'Flask',
+    'flask_cors':         'Flask-CORS',
+    'flask_socketio':     'Flask-SocketIO',
+    'gevent':             'gevent',
+    'geventwebsocket':    'gevent-websocket',
+    'OpenSSL':            'pyOpenSSL',
+    'bs4':                'beautifulsoup4',
+    'tqdm':               'tqdm',
+    'pem':                'pem',
+    'cryptography':       'cryptography',
+    'scapy':              'scapy',
 }
 for mod, pkg in pkgs.items():
     found = importlib.util.find_spec(mod) is not None
