@@ -229,6 +229,8 @@ apt_install "libssl-dev"        # OpenSSL headers (eaphammer build)
 apt_install "libffi-dev"        # FFI (cryptography Python package)
 apt_install "build-essential"   # gcc / make (native extension builds)
 apt_install "pkg-config"        # library path resolution
+apt_install "libnl-3-dev"       # netlink library (nl80211 driver in hostapd)
+apt_install "libnl-genl-3-dev"  # generic netlink (required by nl80211 driver)
 
 step "Python3 build tools"
 
@@ -369,45 +371,82 @@ elif [[ -f "${EAPHAMMER_DIR}/setup.sh" ]]; then
       || warn "eaphammer setup.sh had errors — check $LOG_FILE"
 fi
 
-# ── Create a venv-aware wrapper so wifi_pentest.sh can call eaphammer ──────
+# ── Compile libhostapd-eaphammer.so (required by captive portal & evil twin) ──
+step "Compiling libhostapd-eaphammer.so"
+
+HOSTAPD_BUILD_DIR="${EAPHAMMER_DIR}/local/hostapd-eaphammer/hostapd"
+HOSTAPD_LIB="${HOSTAPD_BUILD_DIR}/libhostapd-eaphammer.so"
+
+if [[ -f "$HOSTAPD_LIB" ]]; then
+    ok "libhostapd-eaphammer.so already exists — skipping build"
+elif [[ -d "$HOSTAPD_BUILD_DIR" ]]; then
+    info "Copying defconfig → .config ..."
+    cp "${HOSTAPD_BUILD_DIR}/defconfig" "${HOSTAPD_BUILD_DIR}/.config" >> "$LOG_FILE" 2>&1
+    info "Running make hostapd-eaphammer_lib (this may take a minute) ..."
+    if ( cd "$HOSTAPD_BUILD_DIR" && make hostapd-eaphammer_lib >> "$LOG_FILE" 2>&1 ); then
+        ok "libhostapd-eaphammer.so compiled: $HOSTAPD_LIB"
+    else
+        err "hostapd compilation failed — captive portal / evil twin modules will not work"
+        err "Check $LOG_FILE for details"
+        FAILED+=("libhostapd-eaphammer build")
+    fi
+else
+    warn "hostapd source not found at $HOSTAPD_BUILD_DIR — skipping build"
+    warn "Run: sudo bash install.sh  after eaphammer is fully cloned"
+fi
+
+# ── Patch eaphammer shebang to use venv python ─────────────────────────────
+step "Patching eaphammer binary shebang"
+
+EAPHAMMER_BIN="${EAPHAMMER_DIR}/eaphammer"
+if [[ -x "$EAPHAMMER_BIN" ]]; then
+    ORIG_SHEBANG=$(head -1 "$EAPHAMMER_BIN")
+    if [[ "$ORIG_SHEBANG" == "#!/usr/bin/env python"* || \
+          "$ORIG_SHEBANG" == "#!/usr/bin/python"* ]]; then
+        sed -i "1s|.*|#!${VENV_PYTHON}|" "$EAPHAMMER_BIN"
+        ok "eaphammer shebang patched: #!${VENV_PYTHON}"
+    else
+        ok "eaphammer binary already has correct shebang: $ORIG_SHEBANG"
+    fi
+else
+    warn "eaphammer binary not found at $EAPHAMMER_BIN — was the clone successful?"
+fi
+
+# ── Create a venv-aware wrapper fallback for wifi_pentest.sh ───────────────
 step "Creating eaphammer venv wrapper"
 
 WRAPPER_PATH="${TOOLS_DIR}/eaphammer_wrapper.sh"
 cat > "$WRAPPER_PATH" << WRAPPER_EOF
 #!/usr/bin/env bash
-# WiFiZer0 — eaphammer wrapper
-# Activates the shared venv and delegates to eaphammer in WiFiZer0_Tools/
+# WiFiZer0 — eaphammer venv wrapper (fallback; primary is eaphammer binary)
+# Activates the shared venv and delegates to the eaphammer binary.
 VENV_DIR="${VENV_DIR}"
 EAPHAMMER_DIR="${EAPHAMMER_DIR}"
-VENV_PYTHON="${VENV_DIR}/bin/python3"
 source "\${VENV_DIR}/bin/activate"
-exec "\${VENV_PYTHON}" "\${EAPHAMMER_DIR}/eaphammer.py" "\$@"
+exec "\${EAPHAMMER_DIR}/eaphammer" "\$@"
 WRAPPER_EOF
 chmod +x "$WRAPPER_PATH"
 ok "Wrapper created: $WRAPPER_PATH"
 
-# Also create a convenience symlink at WiFiZer0_Tools/eaphammer if the clone
-# put the main script somewhere predictable
-EAPHAMMER_PY="${EAPHAMMER_DIR}/eaphammer.py"
-EAPHAMMER_BIN="${EAPHAMMER_DIR}/eaphammer"
-if [[ -f "$EAPHAMMER_PY" && ! -x "$EAPHAMMER_BIN" ]]; then
-    # Make the main python file executable and wrap it
-    cat > "$EAPHAMMER_BIN" << EAP_EOF
-#!/usr/bin/env bash
-source "${VENV_DIR}/bin/activate"
-exec "${VENV_PYTHON}" "${EAPHAMMER_PY}" "\$@"
-EAP_EOF
-    chmod +x "$EAPHAMMER_BIN"
-    ok "eaphammer launcher created: $EAPHAMMER_BIN"
-elif [[ -x "$EAPHAMMER_BIN" ]]; then
-    # Prepend venv activation to the existing script
-    ORIG_SHEBANG=$(head -1 "$EAPHAMMER_BIN")
-    if [[ "$ORIG_SHEBANG" == "#!/usr/bin/env python"* ]]; then
-        # Replace python shebang with our venv python
-        sed -i "1s|.*|#!${VENV_PYTHON}|" "$EAPHAMMER_BIN"
-        ok "eaphammer shebang patched to use venv python"
+# ── Generate eaphammer DH parameters file (required for WPA2-Enterprise) ───
+step "Generating eaphammer DH parameters"
+
+EAP_CERTS_DIR="${EAPHAMMER_DIR}/certs"
+EAP_DH_FILE="${EAP_CERTS_DIR}/dh"
+
+# Ensure cert subdirectories exist (eaphammer expects these)
+mkdir -p "${EAP_CERTS_DIR}/active" "${EAP_CERTS_DIR}/ca" "${EAP_CERTS_DIR}/server" 2>/dev/null
+
+if [[ -f "$EAP_DH_FILE" && -s "$EAP_DH_FILE" ]]; then
+    ok "DH params already exist: $EAP_DH_FILE ($(wc -c < "$EAP_DH_FILE") bytes)"
+else
+    info "Generating 2048-bit DH parameters — this may take up to a minute ..."
+    if openssl dhparam -out "$EAP_DH_FILE" 2048 >> "$LOG_FILE" 2>&1; then
+        ok "DH parameters generated: $EAP_DH_FILE"
     else
-        ok "eaphammer binary already executable: $EAPHAMMER_BIN"
+        warn "DH generation failed — enterprise/captive-portal attacks may not work."
+        warn "Retry manually: openssl dhparam -out '${EAP_DH_FILE}' 2048"
+        FAILED+=("eaphammer DH params")
     fi
 fi
 
@@ -557,6 +596,15 @@ if [[ -n "$EAP_FOUND" ]]; then
     printf "  ${GN}[+]${NC} %-20s %s\n" "eaphammer" "$EAP_FOUND"
 else
     printf "  ${RD}[!]${NC} %-20s NOT FOUND\n" "eaphammer"
+    all_ok=0
+fi
+
+# eaphammer DH parameters file
+EAP_DH_CHECK="${EAPHAMMER_DIR}/certs/dh"
+if [[ -f "$EAP_DH_CHECK" && -s "$EAP_DH_CHECK" ]]; then
+    printf "  ${GN}[+]${NC} %-20s %s  [%d bytes]\n" "eaphammer/certs/dh" "$EAP_DH_CHECK" "$(wc -c < "$EAP_DH_CHECK")"
+else
+    printf "  ${RD}[!]${NC} %-20s NOT FOUND — enterprise attacks will fail\n" "eaphammer/certs/dh"
     all_ok=0
 fi
 
