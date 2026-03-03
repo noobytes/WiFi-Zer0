@@ -51,6 +51,8 @@ declare -a INSTALLED=()
 declare -a SKIPPED=()
 declare -a FAILED=()
 declare -a WARNINGS=()
+CHECK_ONLY=0
+LEGACY_DRY_RUN=0
 
 # ────────────────────────────────────────────────────────────
 #  HELPERS
@@ -63,6 +65,15 @@ err()  { printf "${RD}  [-]${NC} %s\n"  "$*"; log "ERR:  $*"; FAILED+=("$*");   
 info() { printf "${CY}  [*]${NC} %s\n"  "$*"; log "INFO: $*"; }
 step() { printf "\n${AM}${BD}  ══ %s ══${NC}\n" "$*"; log "STEP: $*"; }
 die()  { printf "\n${RD}${BD}  FATAL: %s${NC}\n\n" "$*"; log "FATAL: $*"; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage:
+  sudo bash install.sh            Install and configure dependencies
+  bash install.sh --check         Check dependencies and configuration only
+  bash install.sh -h|--help       Show this help
+EOF
+}
 
 apt_install() {
     local pkg="$1"
@@ -88,6 +99,156 @@ pip_install() {
     fi
 }
 
+run_check_mode() {
+    step "Check mode (no system changes)"
+
+    local -a required_pkgs=(
+        aircrack-ng hcxdumptool hcxtools tshark iw wireless-tools net-tools
+        dialog tmux figlet curl git wget jq sqlite3 openssl
+        reaver bully bettercap hashcat john
+        wpasupplicant arp-scan nmap macchanger isc-dhcp-client
+        ieee-data hostapd dnsmasq apache2
+        libssl-dev libffi-dev build-essential pkg-config libnl-3-dev libnl-genl-3-dev
+        python3 python3-pip python3-venv python3-dev
+        wordlists
+    )
+    local -a required_bins=(
+        airmon-ng airodump-ng aireplay-ng aircrack-ng
+        hcxdumptool hcxpcapngtool tshark iw dialog tmux
+        reaver bully bettercap hashcat
+        wpa_supplicant wpa_cli arp-scan nmap macchanger dhclient
+        sqlite3 openssl
+    )
+    local -a missing_pkgs=()
+    local -a missing_bins=()
+
+    step "APT package presence"
+    local pkg
+    for pkg in "${required_pkgs[@]}"; do
+        if dpkg -s "$pkg" >/dev/null 2>&1; then
+            ok "apt: $pkg"
+        else
+            err "apt: $pkg (missing)"
+            missing_pkgs+=("$pkg")
+        fi
+    done
+
+    step "Binary presence"
+    local bin
+    for bin in "${required_bins[@]}"; do
+        if command -v "$bin" >/dev/null 2>&1; then
+            ok "bin: $bin ($(command -v "$bin"))"
+        else
+            err "bin: $bin (missing)"
+            missing_bins+=("$bin")
+        fi
+    done
+
+    step "Local WiFiZer0 assets"
+    [[ -f "$MAIN_SCRIPT" ]] && ok "main script: $MAIN_SCRIPT" || err "main script missing: $MAIN_SCRIPT"
+    [[ -x "$VENV_PYTHON" ]] && ok "venv python: $VENV_PYTHON" || err "venv python missing: $VENV_PYTHON"
+    [[ -f "$REQ_FILE" ]] && ok "requirements: $REQ_FILE" || warn "requirements.txt missing: $REQ_FILE"
+
+    local local_eap="${EAPHAMMER_DIR}/eaphammer"
+    local eap_wrap="${TOOLS_DIR}/eaphammer_wrapper.sh"
+    local hostapd_lib="${EAPHAMMER_DIR}/local/hostapd-eaphammer/hostapd/libhostapd-eaphammer.so"
+    local eap_dh="${EAPHAMMER_DIR}/certs/dh"
+
+    [[ -d "$EAPHAMMER_DIR/.git" ]] && ok "eaphammer clone: $EAPHAMMER_DIR" || err "eaphammer clone missing: $EAPHAMMER_DIR"
+    if [[ -x "$local_eap" || -x "$eap_wrap" ]] || command -v eaphammer >/dev/null 2>&1; then
+        ok "eaphammer launcher available"
+    else
+        err "eaphammer launcher missing"
+    fi
+    [[ -f "$hostapd_lib" ]] && ok "hostapd-eaphammer lib: $hostapd_lib" || err "hostapd-eaphammer lib missing: $hostapd_lib"
+    [[ -s "$eap_dh" ]] && ok "eaphammer DH params: $eap_dh" || err "eaphammer DH params missing: $eap_dh"
+
+    if [[ -f "/usr/share/ieee-data/oui.txt" ]]; then
+        ok "OUI DB: /usr/share/ieee-data/oui.txt"
+    else
+        warn "OUI DB missing: /usr/share/ieee-data/oui.txt"
+    fi
+
+    if [[ -f "/usr/share/wordlists/rockyou.txt" || -f "/usr/share/wordlists/rockyou.txt.gz" ]]; then
+        ok "rockyou wordlist available"
+    else
+        warn "rockyou wordlist not found"
+    fi
+
+    step "Python package verification"
+    if [[ -x "$VENV_PYTHON" ]]; then
+        local pkg_report
+        pkg_report=$("$VENV_PYTHON" - << 'PYEOF' 2>/dev/null || true
+import importlib.util
+pkgs = {
+    'flask':              'Flask',
+    'flask_cors':         'Flask-CORS',
+    'flask_socketio':     'Flask-SocketIO',
+    'gevent':             'gevent',
+    'geventwebsocket':    'gevent-websocket',
+    'OpenSSL':            'pyOpenSSL',
+    'bs4':                'beautifulsoup4',
+    'tqdm':               'tqdm',
+    'pem':                'pem',
+    'cryptography':       'cryptography',
+    'scapy':              'scapy',
+}
+for mod, pkg in pkgs.items():
+    found = importlib.util.find_spec(mod) is not None
+    print(f"{'OK' if found else 'MISSING'}:{mod}:{pkg}")
+PYEOF
+)
+        local status mod py_pkg
+        while IFS=: read -r status mod py_pkg; do
+            [[ -z "${status:-}" ]] && continue
+            if [[ "$status" == "OK" ]]; then
+                ok "python: $mod ($py_pkg)"
+            else
+                err "python: $mod ($py_pkg) missing"
+            fi
+        done <<< "$pkg_report"
+    else
+        warn "Skipping Python package verification (venv missing)"
+    fi
+
+    step "Check summary"
+    printf "\n"
+    printf "  ${RD}Missing apt packages : %d${NC}\n" "${#missing_pkgs[@]}"
+    printf "  ${RD}Missing binaries     : %d${NC}\n" "${#missing_bins[@]}"
+    printf "  ${YL}Warnings             : %d${NC}\n" "${#WARNINGS[@]}"
+    printf "  ${RD}Failures             : %d${NC}\n" "${#FAILED[@]}"
+
+    if [[ ${#FAILED[@]} -gt 0 ]]; then
+        printf "\n  ${RD}${BD}Check failed.${NC} Install missing items with:\n"
+        printf "  ${AM}sudo bash install.sh${NC}\n\n"
+        return 1
+    fi
+
+    printf "\n  ${GN}${BD}Check passed. All required components are present.${NC}\n\n"
+    return 0
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --check)
+            CHECK_ONLY=1
+            ;;
+        --dry-run)
+            CHECK_ONLY=1
+            LEGACY_DRY_RUN=1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf "${RD}Unknown option:${NC} %s\n\n" "$arg" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+
 # ────────────────────────────────────────────────────────────
 #  BANNER
 # ────────────────────────────────────────────────────────────
@@ -99,13 +260,21 @@ else
     echo "  WiFiZer0"
 fi
 printf "${NC}"
-printf "  ${CY}Wireless Penetration Testing Toolkit — Installer${NC}\n"
+printf "  ${CY}WiFi Security Auditing Toolkit — Installer${NC}\n"
 printf "  ${DM}────────────────────────────────────────────────────────${NC}\n"
-printf "  ${WH}This will install all system packages, Python deps,${NC}\n"
-printf "  ${WH}and clone EAPHammer into:${NC}\n"
+if [[ $CHECK_ONLY -eq 1 ]]; then
+    printf "  ${WH}Check mode: auditing dependencies and configuration only.${NC}\n"
+    printf "  ${WH}No system changes will be made.${NC}\n"
+else
+    printf "  ${WH}This will install all system packages, Python deps,${NC}\n"
+    printf "  ${WH}and clone EAPHammer into:${NC}\n"
+fi
 printf "  ${AM}  %s${NC}\n" "$TOOLS_DIR"
 printf "  ${DM}────────────────────────────────────────────────────────${NC}\n"
-printf "  ${YL}For authorized testing only. Ensure written permission.${NC}\n\n"
+printf "  ${YL}For authorized security auditing only. Ensure written permission.${NC}\n\n"
+if [[ $LEGACY_DRY_RUN -eq 1 ]]; then
+    warn "Option --dry-run is deprecated. Use --check."
+fi
 
 # ────────────────────────────────────────────────────────────
 #  PRE-FLIGHT CHECKS
@@ -113,10 +282,18 @@ printf "  ${YL}For authorized testing only. Ensure written permission.${NC}\n\n"
 step "Pre-flight checks"
 
 # Must be root
-if [[ $EUID -ne 0 ]]; then
-    die "Run as root:  sudo bash install.sh"
+if [[ $CHECK_ONLY -eq 0 ]]; then
+    if [[ $EUID -ne 0 ]]; then
+        die "Run as root:  sudo bash install.sh"
+    fi
+    ok "Running as root"
+else
+    if [[ $EUID -eq 0 ]]; then
+        ok "Running as root (--check mode)"
+    else
+        skip "Not running as root (--check mode does not require root)"
+    fi
 fi
-ok "Running as root"
 
 # Must be on a Debian/Ubuntu/Kali system
 if ! command -v apt-get &>/dev/null; then
@@ -124,17 +301,28 @@ if ! command -v apt-get &>/dev/null; then
 fi
 ok "apt-get available"
 
-# Check internet connectivity
-if ! curl -fs --max-time 5 https://github.com &>/dev/null; then
-    warn "GitHub not reachable — eaphammer clone may fail."
+# Check internet connectivity (install path only)
+if [[ $CHECK_ONLY -eq 0 ]]; then
+    if ! curl -fs --max-time 5 https://github.com &>/dev/null; then
+        warn "GitHub not reachable — eaphammer clone may fail."
+    fi
 fi
 
 # Initialise log
 : > "$LOG_FILE"
-log "WiFiZer0 install started at $(date)"
+if [[ $CHECK_ONLY -eq 1 ]]; then
+    log "WiFiZer0 check started at $(date)"
+else
+    log "WiFiZer0 install started at $(date)"
+fi
 log "SCRIPT_DIR=$SCRIPT_DIR"
 log "TOOLS_DIR=$TOOLS_DIR"
 log "VENV_DIR=$VENV_DIR"
+
+if [[ $CHECK_ONLY -eq 1 ]]; then
+    run_check_mode
+    exit $?
+fi
 
 # ────────────────────────────────────────────────────────────
 #  DIRECTORY STRUCTURE
@@ -177,6 +365,8 @@ apt_install "curl"              # internet checks / downloads
 apt_install "git"               # cloning eaphammer
 apt_install "wget"              # alternative downloader
 apt_install "jq"                # JSON parsing (bettercap output)
+apt_install "sqlite3"           # metadata database backend
+apt_install "openssl"           # DH params generation + cert tooling
 
 step "WPS attack tools"
 
@@ -201,6 +391,7 @@ apt_install "wpasupplicant"     # wpa_supplicant + wpa_cli for PSK verification
 apt_install "arp-scan"          # post-crack LAN host discovery
 apt_install "nmap"              # post-crack network mapping
 apt_install "macchanger"        # MAC address spoofing
+apt_install "isc-dhcp-client"   # dhclient (DHCP lease for PSK verification)
 # cewl is optional (ruby gem) — advisory warn only
 command -v cewl &>/dev/null || warn "cewl not installed (optional for wordlist harvesting; gem install cewl)"
 
@@ -581,12 +772,21 @@ declare -A TOOL_CHECK=(
     ["hcxdumptool"]="hcxdumptool"
     ["hcxpcapngtool"]="hcxtools"
     ["tshark"]="tshark"
+    ["iw"]="iw"
     ["dialog"]="dialog"
     ["tmux"]="tmux"
     ["hashcat"]="hashcat"
     ["reaver"]="reaver"
     ["bully"]="bully"
     ["bettercap"]="bettercap"
+    ["wpa_supplicant"]="wpasupplicant"
+    ["wpa_cli"]="wpasupplicant"
+    ["arp-scan"]="arp-scan"
+    ["nmap"]="nmap"
+    ["macchanger"]="macchanger"
+    ["dhclient"]="isc-dhcp-client"
+    ["sqlite3"]="sqlite3"
+    ["openssl"]="openssl"
     ["figlet"]="figlet"
     ["git"]="git"
 )
